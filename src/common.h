@@ -31,6 +31,11 @@ constexpr const char* kAllInterfaces = "0.0.0.0";
 constexpr const char* kBanFileName = "banlist.dat";
 constexpr const char* kDbPath = "p2p_db";
 
+// The largest data_size a packet header may announce. The receiver allocates what the header
+// announces before reading the data, so a larger value drops the connection instead
+// (Connection::StartRead). Well above every packet the node sends.
+constexpr size_t kMaxPacketSize = size_t(256) * 1024 * 1024;
+
 namespace ba = boost::asio;
 namespace bi = ba::ip;
 

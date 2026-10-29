@@ -1,8 +1,68 @@
 #include "connection.h"
 
+#include <atomic>
+#include <chrono>
+#include <iterator>
+#include <string>
+#include <unordered_map>
+
 #include "utils/log.h"
 
 namespace net {
+
+namespace {
+
+// Log of the headers announcing more than kMaxPacketSize: at most one line a minute per remote
+// address, with the number of such headers since the previous line from that address.
+class OversizedHeaderLog {
+ public:
+  void Report(const bi::address& addr, size_t announced) {
+    using Clock = std::chrono::steady_clock;
+    const auto now = Clock::now();
+    const uint64_t total = ++total_;
+    uint64_t count = 0;
+    {
+      Guard g(mux_);
+      if (peers_.size() >= kMaxAddresses) {
+        for (auto it = peers_.begin(); it != peers_.end();) {
+          it = now - it->second.last >= kInterval ? peers_.erase(it) : std::next(it);
+        }
+        if (peers_.size() >= kMaxAddresses) peers_.clear();
+      }
+      auto res = peers_.try_emplace(addr.to_string());
+      auto& entry = res.first->second;
+      ++entry.count;
+      if (!res.second && now - entry.last < kInterval) return;
+      count = entry.count;
+      entry.count = 0;
+      entry.last = now;
+    }
+    LOG(ERROR) << "Packet header from " << addr << " announces " << announced
+               << " bytes, above the limit of " << kMaxPacketSize
+               << ": connection dropped (" << count << " from this address since the last report, "
+               << total << " in total)";
+  }
+
+ private:
+  static constexpr std::chrono::seconds kInterval{60};
+  static constexpr size_t kMaxAddresses = 4096;
+
+  struct Entry {
+    std::chrono::steady_clock::time_point last{};
+    uint64_t count = 0;
+  };
+
+  std::atomic<uint64_t> total_{0};
+  Mutex mux_;
+  std::unordered_map<std::string, Entry> peers_;
+};
+
+OversizedHeaderLog& GetOversizedHeaderLog() {
+  static OversizedHeaderLog log;
+  return log;
+}
+
+} // namespace
 
 Connection::Connection(ConnectionOwner& h, ba::io_context& io)
     : host_(h),
@@ -84,6 +144,15 @@ void Connection::StartRead() {
             Unserializer u(packet_.data.data(), Packet::Header::size);
             if (!packet_.GetHeader(u)) {
               LOG(DEBUG) << "Invalid header received.";
+              Drop(kProtocolCorrupted);
+              return;
+            }
+
+            if (packet_.header.data_size > kMaxPacketSize) {
+              boost::system::error_code ec;
+              auto ep = socket_.remote_endpoint(ec);
+              GetOversizedHeaderLog().Report(ec ? bi::address() : ep.address(),
+                                             packet_.header.data_size);
               Drop(kProtocolCorrupted);
               return;
             }
