@@ -7,6 +7,10 @@ namespace net {
 RoutingTable::Pinger::Pinger(RoutingTable& rt) : routing_table_(rt) {}
 
 RoutingTable::Pinger::~Pinger() {
+  Join();
+}
+
+void RoutingTable::Pinger::Join() {
   if (ping_thread_.joinable()) {
     ping_thread_.join();
   }

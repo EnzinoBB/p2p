@@ -37,11 +37,16 @@ Host::Host(const Config& config, HostEventHandler& event_handler)
 
 Host::~Host() {
   io_.stop();
-  routing_table_->Stop();
 
   if (working_thread_.joinable()) {
     working_thread_.join();
   }
+
+  // No handler runs any more: the routing table's threads end and its socket closes, and the
+  // Network singleton drops its reference (Run) so that the routing table goes with this host,
+  // while io_ still exists, not at static destruction against a destroyed io_context.
+  routing_table_->Stop();
+  Network::Instance().SetRoutingTable(nullptr);
 }
 
 void Host::Run() {

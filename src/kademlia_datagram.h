@@ -22,6 +22,8 @@ struct KademliaDatagram {
   UdpDatagram BaseToUdp(const NodeEntrance& to, uint8_t type, bool user_data) const noexcept;
 
   NodeEntrance node_from;
+  // the datagram carried the sender's user data (node_from.user_data is 0 otherwise)
+  bool has_user_data = false;
 };
 
 struct PingDatagram : public KademliaDatagram {

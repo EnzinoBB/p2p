@@ -39,6 +39,9 @@ class RoutingTable : public UdpSocketEventHandler {
   RoutingTable(ba::io_context& io, RoutingTableEventHandler& host);
   ~RoutingTable() override;
 
+  // Ends the pinger and explorer threads and closes the UDP socket. Called once the io_context
+  // has stopped and its threads have ended (~Host), so that nothing else uses the socket.
+  // Idempotent; the destructor calls it too.
   void Stop();
 
   // starts lookup if not started yet
@@ -89,8 +92,9 @@ class RoutingTable : public UdpSocketEventHandler {
 
   uint16_t KBucketIndex(const NodeId& id) const noexcept;
 
-  void UpdateKBuckets(const NodeEntrance&);
-  void UpdateKBuckets(const std::vector<NodeEntrance>&);
+  // Adds or refreshes the sender of a direct datagram, whose endpoint CheckEndpoint matched.
+  // Only for that sender: a node listed by another one (FindNode replies) is never written here.
+  void UpdateKBuckets(const NodeEntrance& sender, bool has_user_data);
 
   void OnNodeFound(const NodeEntrance&);
   void OnNodeNotFound(const NodeId&);
@@ -110,6 +114,7 @@ class RoutingTable : public UdpSocketEventHandler {
     ~NetExplorer();
 
     void Start(std::future<void>&& stop_condition);
+    void Join();
     void Find(const NodeId&, const std::vector<NodeEntrance>& find_list);
     void CheckFindNodeResponce(const KademliaDatagram&);
     void GetKnownNodes(std::vector<NodeEntrance>&);
@@ -146,6 +151,7 @@ class RoutingTable : public UdpSocketEventHandler {
     ~Pinger();
 
     void Start(std::future<void>&& stop_condition);
+    void Join();
     void SendPing(const NodeEntrance& target, KBucket& bucket,
                   std::shared_ptr<NodeEntrance> replacer = nullptr);
     void CheckPingResponce(const KademliaDatagram&);
@@ -176,6 +182,7 @@ class RoutingTable : public UdpSocketEventHandler {
 
   std::promise<void> pinger_stopper_;
   std::promise<void> discovery_stopper_;
+  std::atomic<bool> stopped_{false};
 };
 
 inline NodeId RoutingTable::Distance(const NodeId& a, const NodeId& b) {

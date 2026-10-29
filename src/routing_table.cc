@@ -27,13 +27,22 @@ RoutingTable::RoutingTable(ba::io_context& io,
 }
 
 RoutingTable::~RoutingTable() {
+  // the pinger and explorer threads use the k-buckets: they end first
+  Stop();
+
   Guard g(k_bucket_mux_);
   delete []k_buckets_;
 }
 
 void RoutingTable::Stop() {
+  if (stopped_.exchange(true)) return;
+
   pinger_stopper_.set_value();
   discovery_stopper_.set_value();
+
+  // the threads send on the socket: closed once they have ended
+  pinger_.Join();
+  explorer_.Join();
 
   socket_->Close();
 }
@@ -63,7 +72,18 @@ void RoutingTable::GetKnownNodes(std::vector<NodeEntrance>& result) {
   result.clear();
 
   if (Network::Instance().GetConfig().full_net_discovery) {
-    return explorer_.GetKnownNodes(result);
+    explorer_.GetKnownNodes(result);
+
+    // The explorer keeps the user data it first saw for a node, often from another node's reply.
+    // A node in the k-buckets has the value of its own latest datagram: that one is shown.
+    Guard g(k_bucket_mux_);
+    for (auto& n : result) {
+      auto index = KBucketIndex(n.id);
+      if (index == kIvalidIndex) continue;
+      NodeEntrance direct;
+      if (k_buckets_[index].Get(n.id, direct)) n.user_data = direct.user_data;
+    }
+    return;
   }
 
   Guard g(k_bucket_mux_);
@@ -136,7 +156,7 @@ void RoutingTable::OnPacketReceived(const bi::udp::endpoint& from, const ByteVec
       break;
   }
 
-  UpdateKBuckets(packet->node_from);
+  UpdateKBuckets(packet->node_from, packet->has_user_data);
 }
 
 bool RoutingTable::CheckEndpoint(const KademliaDatagram& d) {
@@ -165,18 +185,21 @@ void RoutingTable::HandleFindNode(const KademliaDatagram& d) {
   socket_->Send(answer.ToUdp(d.node_from));
 }
 
-void RoutingTable::UpdateKBuckets(const std::vector<NodeEntrance>& nodes) {
-  for (auto& n : nodes) {
-    UpdateKBuckets(n);
-  }
-}
-
-void RoutingTable::UpdateKBuckets(const NodeEntrance& node) {
+void RoutingTable::UpdateKBuckets(const NodeEntrance& node, bool has_user_data) {
   if (node.id == host_data_.id) return;
 
   Guard g(k_bucket_mux_);
   KBucket& bucket = k_buckets_[KBucketIndex(node.id)];
-  if (bucket.Exists(node.id)) {
+  NodeEntrance existing;
+  if (bucket.Get(node.id, existing)) {
+    // The entry is refreshed only from its own endpoint (checked again under the lock: the entry
+    // may have changed since CheckEndpoint), and only its user data (version, capabilities):
+    // address and ports stay as recorded (the TCP port is UpdateTcpPort's).
+    if (has_user_data && existing.user_data != node.user_data &&
+        existing.address == node.address && existing.udp_port == node.udp_port) {
+      existing.user_data = node.user_data;
+      bucket.Update(existing);
+    }
     bucket.Promote(node.id);
   } else if (bucket.Size() < k) {
     bucket.AddNode(node);

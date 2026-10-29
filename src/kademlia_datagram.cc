@@ -14,19 +14,27 @@ KademliaDatagram::ReinterpretUdpPacket(const bi::udp::endpoint& from, const Byte
   node_from.udp_port = from.port();
 
   switch (type) {
-    case PingDatagram::type :
-      u.Get(node_from.user_data);
-      return std::make_unique<PingDatagram>(node_from);
+    case PingDatagram::type : {
+      bool has_user_data = u.Get(node_from.user_data);
+      auto d = std::make_unique<PingDatagram>(node_from);
+      d->has_user_data = has_user_data;
+      return d;
+    }
 
-    case PingRespDatagram::type :
-      u.Get(node_from.user_data);
-      return std::make_unique<PingRespDatagram>(node_from);
+    case PingRespDatagram::type : {
+      bool has_user_data = u.Get(node_from.user_data);
+      auto d = std::make_unique<PingRespDatagram>(node_from);
+      d->has_user_data = has_user_data;
+      return d;
+    }
 
     case FindNodeDatagram::type : {
       NodeId target;
       if (!u.Get(reinterpret_cast<uint8_t*>(target.GetPtr()), target.size())) return nullptr;
-      u.Get(node_from.user_data);
-      return std::make_unique<FindNodeDatagram>(node_from, target);
+      bool has_user_data = u.Get(node_from.user_data);
+      auto d = std::make_unique<FindNodeDatagram>(node_from, target);
+      d->has_user_data = has_user_data;
+      return d;
     }
 
     case FindNodeRespDatagram::type : {
@@ -40,8 +48,10 @@ KademliaDatagram::ReinterpretUdpPacket(const bi::udp::endpoint& from, const Byte
         if (!u.Get(ent)) return nullptr;
         closest.push_back(ent);
       }
-      u.Get(node_from.user_data);
-      return std::make_unique<FindNodeRespDatagram>(node_from, target, std::move(closest));
+      bool has_user_data = u.Get(node_from.user_data);
+      auto d = std::make_unique<FindNodeRespDatagram>(node_from, target, std::move(closest));
+      d->has_user_data = has_user_data;
+      return d;
     }
 
     default :
