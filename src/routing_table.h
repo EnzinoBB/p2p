@@ -92,9 +92,11 @@ class RoutingTable : public UdpSocketEventHandler {
 
   uint16_t KBucketIndex(const NodeId& id) const noexcept;
 
-  // Adds or refreshes the sender of a direct datagram, whose endpoint CheckEndpoint matched.
-  // Only for that sender: a node listed by another one (FindNode replies) is never written here.
-  void UpdateKBuckets(const NodeEntrance& sender, bool has_user_data);
+  // Adds the sender of a direct datagram, whose endpoint CheckEndpoint matched, or promotes it.
+  // refresh_user_data: the datagram answers a ping of ours (and carried user data), so the
+  // sender's entry takes its user data. Only for that sender: a node listed by another one
+  // (FindNode replies) is never written here.
+  void UpdateKBuckets(const NodeEntrance& sender, bool refresh_user_data);
 
   void OnNodeFound(const NodeEntrance&);
   void OnNodeNotFound(const NodeId&);
@@ -154,7 +156,8 @@ class RoutingTable : public UdpSocketEventHandler {
     void Join();
     void SendPing(const NodeEntrance& target, KBucket& bucket,
                   std::shared_ptr<NodeEntrance> replacer = nullptr);
-    void CheckPingResponce(const KademliaDatagram&);
+    // true when the response answers an outstanding ping of ours
+    bool CheckPingResponce(const KademliaDatagram&);
 
    private:
     void PingRoutine(std::future<void>&&);
@@ -183,6 +186,11 @@ class RoutingTable : public UdpSocketEventHandler {
   std::promise<void> pinger_stopper_;
   std::promise<void> discovery_stopper_;
   std::atomic<bool> stopped_{false};
+
+  // NotifyHost threads still running (Stop waits for them, see there)
+  Mutex notify_mux_;
+  std::condition_variable notify_cv_;
+  size_t notify_running_ = 0;
 };
 
 inline NodeId RoutingTable::Distance(const NodeId& a, const NodeId& b) {

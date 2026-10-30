@@ -107,8 +107,8 @@ void RoutingTable::Pinger::SendPing(const NodeEntrance& target, KBucket& bucket,
   timer->async_wait(std::move(callback));
 }
 
-void RoutingTable::Pinger::CheckPingResponce(const KademliaDatagram& d) {
+bool RoutingTable::Pinger::CheckPingResponce(const KademliaDatagram& d) {
   Guard g(ping_mux_);
-  ping_sent_.erase(d.node_from.id);
+  return ping_sent_.erase(d.node_from.id) > 0;
 }
 } // namespace net

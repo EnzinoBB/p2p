@@ -35,6 +35,9 @@ constexpr const char* kDbPath = "p2p_db";
 // announces before reading the data, so a larger value drops the connection instead
 // (Connection::StartRead). Well above every packet the node sends.
 constexpr size_t kMaxPacketSize = size_t(256) * 1024 * 1024;
+// The largest data_size of the first packet of a connection, the registration (Network's RegData:
+// address type, an IPv4 or IPv6 address and a port, 7 or 19 bytes).
+constexpr size_t kMaxRegistrationSize = 64;
 
 namespace ba = boost::asio;
 namespace bi = ba::ip;

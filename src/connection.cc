@@ -16,7 +16,7 @@ namespace {
 // address, with the number of such headers since the previous line from that address.
 class OversizedHeaderLog {
  public:
-  void Report(const bi::address& addr, size_t announced) {
+  void Report(const bi::address& addr, size_t announced, size_t limit) {
     using Clock = std::chrono::steady_clock;
     const auto now = Clock::now();
     const uint64_t total = ++total_;
@@ -29,7 +29,8 @@ class OversizedHeaderLog {
         }
         if (peers_.size() >= kMaxAddresses) peers_.clear();
       }
-      auto res = peers_.try_emplace(addr.to_string());
+      // one line a minute per address and limit (registration or later packet)
+      auto res = peers_.try_emplace(addr.to_string() + "/" + std::to_string(limit));
       auto& entry = res.first->second;
       ++entry.count;
       if (!res.second && now - entry.last < kInterval) return;
@@ -38,7 +39,7 @@ class OversizedHeaderLog {
       entry.last = now;
     }
     LOG(ERROR) << "Packet header from " << addr << " announces " << announced
-               << " bytes, above the limit of " << kMaxPacketSize
+               << " bytes, above the limit of " << limit
                << ": connection dropped (" << count << " from this address since the last report, "
                << total << " in total)";
   }
@@ -148,69 +149,101 @@ void Connection::StartRead() {
               return;
             }
 
-            if (packet_.header.data_size > kMaxPacketSize) {
+            // Before registration only a registration packet (RegData: 7 or 19 bytes) is accepted;
+            // after it, at most kMaxPacketSize. The data is read in chunks (ReadData), so the memory
+            // held follows the bytes actually received, not the size announced.
+            const bool registration_expected = !registation_passed_;
+            const size_t limit = registration_expected ? kMaxRegistrationSize : kMaxPacketSize;
+            if (registration_expected && !packet_.IsRegistration()) {
+              Drop(kProtocolCorrupted);
+              return;
+            }
+            if (packet_.header.data_size > limit) {
               boost::system::error_code ec;
               auto ep = socket_.remote_endpoint(ec);
               GetOversizedHeaderLog().Report(ec ? bi::address() : ep.address(),
-                                             packet_.header.data_size);
+                                             packet_.header.data_size, limit);
               Drop(kProtocolCorrupted);
               return;
             }
 
-            try {
-              packet_.data.resize(packet_.header.data_size);
-            } catch (...) {
-              LOG(DEBUG) << "Invalid header received: bad protocol.";
-              Drop(kProtocolCorrupted);
-              return;
-            }
-
-            ba::async_read(socket_, ba::buffer(packet_.data, packet_.header.data_size),
-                    [this, self](const boost::system::error_code& er, size_t len) {
-                      if (dropped_) {
-                        return;
-                      }
-                      ResetTimer();
-
-                      if (!CheckRead(er, packet_.header.data_size, len)) {
-                        LOG(DEBUG) << "Packet data check read failed.";
-                        Drop(kReadError);
-                        return;
-                      }
-
-                      bool is_reg = packet_.IsRegistration();
-
-                      if (!registation_passed_) {
-                        if (!is_reg) {
-                          Drop(kProtocolCorrupted);
-                          return;
-                        } else {
-                          registation_passed_ = true;
-
-                          if (!active_) {
-                            remote_node_ = packet_.header.sender;
-                          }
-
-                          host_.OnConnected(std::move(packet_), self);
-                          packet_ = Packet();
-                          StartRead();
-                          return;
-                        }
-                      }
-
-                      if (is_reg) {
-                        LOG(DEBUG) << "Reg packet recieved, when registartion passed.";
-                        Drop(kProtocolCorrupted);
-                        return;
-                      }
-
-                      host_.OnPacketReceived(std::move(packet_));
-                      packet_ = Packet();
-                      StartRead();
-                    }
-            );
+            packet_.data.clear();
+            ReadData();
          }
   );
+}
+
+void Connection::ReadData() {
+  const size_t total = packet_.header.data_size;
+  const size_t received = packet_.data.size();
+  if (received == total) {
+    OnPacketRead();
+    return;
+  }
+
+  const size_t chunk = std::min(total - received, kReadChunkSize);
+  try {
+    if (packet_.data.capacity() < received + chunk) {
+      // geometric growth, never above the announced size
+      packet_.data.reserve(std::min(total, std::max(received + chunk, 2 * packet_.data.capacity())));
+    }
+    packet_.data.resize(received + chunk);
+  } catch (...) {
+    LOG(DEBUG) << "Cannot allocate packet data.";
+    Drop(kProtocolCorrupted);
+    return;
+  }
+
+  Ptr self(shared_from_this());
+  ba::async_read(socket_, ba::buffer(packet_.data.data() + received, chunk),
+          [this, self, chunk](const boost::system::error_code& er, size_t len) {
+            if (dropped_) {
+              return;
+            }
+            ResetTimer();
+
+            if (!CheckRead(er, chunk, len)) {
+              LOG(DEBUG) << "Packet data check read failed.";
+              Drop(kReadError);
+              return;
+            }
+
+            ReadData();
+          }
+  );
+}
+
+void Connection::OnPacketRead() {
+  Ptr self(shared_from_this());
+  bool is_reg = packet_.IsRegistration();
+
+  if (!registation_passed_) {
+    if (!is_reg) {
+      Drop(kProtocolCorrupted);
+      return;
+    } else {
+      registation_passed_ = true;
+
+      if (!active_) {
+        remote_node_ = packet_.header.sender;
+      }
+
+      host_.OnConnected(std::move(packet_), self);
+      packet_ = Packet();
+      StartRead();
+      return;
+    }
+  }
+
+  if (is_reg) {
+    LOG(DEBUG) << "Reg packet recieved, when registartion passed.";
+    Drop(kProtocolCorrupted);
+    return;
+  }
+
+  host_.OnPacketReceived(std::move(packet_));
+  packet_ = Packet();
+  StartRead();
 }
 
 bool Connection::CheckRead(const boost::system::error_code& er, size_t expected, size_t len) {

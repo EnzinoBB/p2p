@@ -45,6 +45,14 @@ void RoutingTable::Stop() {
   explorer_.Join();
 
   socket_->Close();
+
+  // The io thread and the pinger and explorer threads have ended (~Host joins the io thread
+  // first), so no new notification starts; those still running call into the host, which is
+  // being destroyed: wait for them, a bounded time so that a blocked handler cannot hang the exit.
+  UniqueGuard g(notify_mux_);
+  if (!notify_cv_.wait_for(g, std::chrono::seconds(5), [this] { return notify_running_ == 0; })) {
+    LOG(ERROR) << "Routing table stopped with " << notify_running_ << " host notification(s) still running";
+  }
 }
 
 void RoutingTable::AddNodes(const std::vector<NodeEntrance>& nodes) {
@@ -81,7 +89,7 @@ void RoutingTable::GetKnownNodes(std::vector<NodeEntrance>& result) {
       auto index = KBucketIndex(n.id);
       if (index == kIvalidIndex) continue;
       NodeEntrance direct;
-      if (k_buckets_[index].Get(n.id, direct)) n.user_data = direct.user_data;
+      if (k_buckets_[index].Get(n.id, direct) && direct.user_data) n.user_data = direct.user_data;
     }
     return;
   }
@@ -139,12 +147,16 @@ void RoutingTable::OnPacketReceived(const bi::udp::endpoint& from, const ByteVec
     return;
   }
 
+  // a node's user data (version, capabilities) is refreshed only from the answer to a ping of
+  // ours: an unsolicited datagram with a forged source address cannot change it
+  bool refresh_user_data = false;
+
   switch (packet->DatagramType()) {
     case PingDatagram::type :
       HandlePing(*packet);
       break;
     case PingRespDatagram::type :
-      pinger_.CheckPingResponce(*packet);
+      refresh_user_data = pinger_.CheckPingResponce(*packet) && packet->has_user_data;
       break;
     case FindNodeDatagram::type :
       HandleFindNode(*packet);
@@ -156,7 +168,7 @@ void RoutingTable::OnPacketReceived(const bi::udp::endpoint& from, const ByteVec
       break;
   }
 
-  UpdateKBuckets(packet->node_from, packet->has_user_data);
+  UpdateKBuckets(packet->node_from, refresh_user_data);
 }
 
 bool RoutingTable::CheckEndpoint(const KademliaDatagram& d) {
@@ -185,7 +197,7 @@ void RoutingTable::HandleFindNode(const KademliaDatagram& d) {
   socket_->Send(answer.ToUdp(d.node_from));
 }
 
-void RoutingTable::UpdateKBuckets(const NodeEntrance& node, bool has_user_data) {
+void RoutingTable::UpdateKBuckets(const NodeEntrance& node, bool refresh_user_data) {
   if (node.id == host_data_.id) return;
 
   Guard g(k_bucket_mux_);
@@ -195,7 +207,7 @@ void RoutingTable::UpdateKBuckets(const NodeEntrance& node, bool has_user_data) 
     // The entry is refreshed only from its own endpoint (checked again under the lock: the entry
     // may have changed since CheckEndpoint), and only its user data (version, capabilities):
     // address and ports stay as recorded (the TCP port is UpdateTcpPort's).
-    if (has_user_data && existing.user_data != node.user_data &&
+    if (refresh_user_data && existing.user_data != node.user_data &&
         existing.address == node.address && existing.udp_port == node.udp_port) {
       existing.user_data = node.user_data;
       bucket.Update(existing);
@@ -254,9 +266,23 @@ void RoutingTable::OnNodeNotFound(const NodeId& id) {
 }
 
 void RoutingTable::NotifyHost(const NodeEntrance& node, RoutingTableEventType event) {
-  std::thread t([this, node, event]() {
-                  host_.HandleRoutTableEvent(node, event);
-                });
-  t.detach();
+  {
+   Guard g(notify_mux_);
+   ++notify_running_;
+  }
+  try {
+    std::thread t([this, node, event]() {
+                    try {
+                      host_.HandleRoutTableEvent(node, event);
+                    } catch (...) {}
+                    Guard g(notify_mux_);
+                    --notify_running_;
+                    notify_cv_.notify_all();
+                  });
+    t.detach();
+  } catch (...) {
+    Guard g(notify_mux_);
+    --notify_running_;
+  }
 }
 } // namespace net
